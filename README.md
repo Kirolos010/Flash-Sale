@@ -200,33 +200,119 @@ Processes payment result with idempotency. Safe to receive multiple times.
 }
 ```
 
-## Running Tests
+## Stock Lifecycle Sequence
 
-**Note**: Tests require a database. By default, tests use MySQL. Ensure your `.env` or `phpunit.xml` is configured with a test database.
+### Complete Flow Example
 
-Create a test database:
-```sql
-CREATE DATABASE flash_sale_test;
+Let's trace a complete transaction from start to finish:
+
+#### Initial State
+```
+total_stock = 100        (Total quantity in inventory)
+available_stock = 100    (Available for reservation)
 ```
 
-Run all tests:
-```bash
-php artisan test
+#### Step 1: Create Hold (POST /api/holds)
+**User:** Ahmed reserves 10 items
+
+**What happens:**
+1. System checks `available_stock`
+2. If sufficient, creates a Hold
+3. `total_stock` remains unchanged
+4. `available_stock` decreases (temporary reservation)
+
+**Result:**
+```
+total_stock = 100        (unchanged)
+available_stock = 90     ⬇️ (temporary deduction)
+hold.is_used = false
+hold.expires_at = now() + 2 minutes
 ```
 
-Run specific test suite:
-```bash
-php artisan test --filter ConcurrencyTest
-php artisan test --filter HoldExpiryTest
-php artisan test --filter PaymentWebhookTest
+#### Step 2: Create Order (POST /api/orders)
+**User:** Ahmed converts Hold to Order
+
+**What happens:**
+1. Hold is converted to Order
+2. Hold becomes `is_used = true` (no longer active)
+3. Order status = `pending` (waiting for payment)
+4. `total_stock` remains unchanged
+5. `available_stock` remains unchanged (because Order is pending)
+
+**Result:**
+```
+total_stock = 100        (unchanged)
+available_stock = 90     (unchanged - Order is pending)
+hold.is_used = true
+order.status = "pending"
 ```
 
-### Test Coverage
+#### Step 3: Payment Success (POST /api/payments/webhook)
+**Payment Provider:** Sends webhook with `status: "success"`
 
-- ✅ **Concurrency**: Parallel hold attempts at stock boundary (no oversell)
-- ✅ **Hold Expiry**: Expired holds release availability
-- ✅ **Webhook Idempotency**: Same key processed only once
-- ✅ **Out-of-Order Webhooks**: Webhook arriving before order creation
+**What happens:**
+1. Order status changes to `paid`
+2. `total_stock` decreases (final deduction - product is sold)
+3. `available_stock` decreases (because total_stock decreased)
+
+**Result:**
+```
+total_stock = 90         ⬇️ (final deduction - product sold)
+available_stock = 90     ⬇️ (decreased because total_stock decreased)
+order.status = "paid"
+```
+
+### Alternative Scenarios
+
+#### Scenario A: Hold Expires
+**What happens:**
+1. Hold expires after 2+ minutes
+2. Background job processes expired hold
+3. Hold becomes `is_used = true`
+4. `total_stock` remains unchanged
+5. `available_stock` increases (Hold is no longer active)
+
+**Result:**
+```
+total_stock = 100        (unchanged)
+available_stock = 100    ⬆️ (increased - Hold is no longer active)
+hold.is_used = true
+```
+
+#### Scenario B: Payment Failed
+**Payment Provider:** Sends webhook with `status: "failed"`
+
+**What happens:**
+1. Order status changes to `cancelled`
+2. `total_stock` remains unchanged (never decremented)
+3. `available_stock` increases (Order is no longer pending)
+
+**Result:**
+```
+total_stock = 100        (unchanged)
+available_stock = 100    ⬆️ (increased - Order cancelled)
+order.status = "cancelled"
+```
+
+### Summary Table
+
+| Stage | total_stock | available_stock | Notes |
+|-------|-------------|-----------------|-------|
+| **Initial** | 100 | 100 | - |
+| **After Hold** | 100 | 90 ⬇️ | Active hold (temporary) |
+| **After Order** | 100 | 90 | Order pending |
+| **Payment Success** | 90 ⬇️ | 90 ⬇️ | Final deduction (sold) |
+| **Hold Expired** | 100 | 100 ⬆️ | Hold no longer active |
+| **Payment Failed** | 100 | 100 ⬆️ | Order cancelled |
+
+### Key Rules
+
+1. **total_stock** only changes when payment succeeds (final deduction)
+2. **available_stock** = `total_stock - active_holds - pending_orders`
+3. **Hold** creates temporary reservation (doesn't change total_stock)
+4. **Order** keeps stock reserved until payment succeeds or fails
+5. **Payment Success** → final stock deduction (product sold)
+6. **Payment Failed** → stock becomes available again
 
 ## Background Processing
 
@@ -282,9 +368,10 @@ tail -f storage/logs/laravel.log
 
 ### Stock Calculation
 
-Available stock = Total stock - Sum of active holds
+Available stock = Total stock - Active holds - Pending orders
 
-Active holds = Non-expired (`expires_at > now()`) AND unused (`is_used = false`)
+**Active holds** = Non-expired (`expires_at > now()`) AND unused (`is_used = false`)
+**Pending orders** = Orders with status `pending` (waiting for payment)
 
 ### Webhook Idempotency
 
@@ -298,8 +385,9 @@ Active holds = Non-expired (`expires_at > now()`) AND unused (`is_used = false`)
 
 1. Background job finds expired, unused holds
 2. Locks hold row to prevent double-processing
-3. Marks hold as used
-4. Invalidates stock cache (availability automatically recalculated)
+3. Marks hold as used (no longer active)
+4. Invalidates stock cache (available_stock automatically recalculated)
+5. `total_stock` remains unchanged
 
 ## Performance Considerations
 

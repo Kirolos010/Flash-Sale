@@ -416,6 +416,4 @@ Available stock = Total stock - Active holds - Pending orders
 - System automatically retries (up to 5 times)
 - Monitor deadlock frequency in logs
 
-## License
 
-MIT License
